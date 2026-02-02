@@ -7,9 +7,9 @@ case "$1" in
         if getent passwd pymc-repeater >/dev/null; then
             deluser --system pymc-repeater || true
         fi
-        rm -rf /etc/pymc-repeater
-        rm -rf /var/log/pymc-repeater
-        rm -rf /var/lib/pymc-repeater
+        rm -rf /etc/pymc_repeater
+        rm -rf /var/log/pymc_repeater
+        rm -rf /var/lib/pymc_repeater
         ;;
 esac
 
