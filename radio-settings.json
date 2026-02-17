@@ -55,7 +55,7 @@
       "reset_pin": 18,
       "busy_pin": 5,
       "irq_pin": 6,
-      "txen_pin": 26,
+      "txen_pin": -1,
       "rxen_pin": -1,
       "txled_pin": -1,
       "rxled_pin": -1,
