@@ -59,6 +59,7 @@
       "rxen_pin": -1,
       "txled_pin": -1,
       "rxled_pin": -1,
+      "en_pin": 26,
       "tx_power": 22,
       "use_dio3_tcxo": true,
       "use_dio2_rf": true,
