@@ -314,6 +314,9 @@ identities:
 # Supported:
 #   - sx1262        (Linux spidev + system GPIO)
 #   - sx1262_ch341  (CH341 USB-to-SPI + CH341 GPIO 0-7)
+#   - kiss          (KISS-modem over a serial port; alias: kiss-modem)
+#   - pymc_tcp      (pymc_usb firmware modem over Wi-Fi/TCP)
+#   - pymc_usb      (pymc_usb firmware modem over USB-CDC)
 radio_type: sx1262
 
 # CH341 USB-to-SPI adapter settings (only used when radio_type: sx1262_ch341)
@@ -351,6 +354,25 @@ radio:
 # kiss:
 #   port: "/dev/ttyUSB0"
 #   baud_rate: 9600
+
+# pymc_usb firmware modem over Wi-Fi/TCP (when radio_type: pymc_tcp).
+# Requires pyMC_core with the TCPLoRaRadio driver (PR pyMC-dev/pyMC_core#68,
+# merged into dev on 2026-05-13).
+# pymc_tcp:
+#   host: "pymc-3e2834.local"   # modem hostname / mDNS name / LAN IP
+#   port: 5055                  # firmware default
+#   token: ""                   # empty = no auth; set to match firmware NVS token
+#   connect_timeout: 5.0        # seconds; deferred-connect retries with backoff on failure
+#   lbt_enabled: true           # Listen-Before-Talk via firmware CAD
+#   lbt_max_attempts: 5
+
+# pymc_usb firmware modem over USB-CDC (when radio_type: pymc_usb).
+# Requires pyMC_core with the USBLoRaRadio driver (PR pyMC-dev/pyMC_core#68).
+# pymc_usb:
+#   port: "/dev/ttyACM0"        # USB-CDC device; udev rule may symlink to /dev/lora-modem
+#   baudrate: 921600            # must match firmware monitor_speed
+#   lbt_enabled: true
+#   lbt_max_attempts: 5
 
 # SX1262 Hardware Configuration
 # NOTE:
