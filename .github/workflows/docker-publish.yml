@@ -49,3 +49,21 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Notify Home Assistant add-on repository
+        env:
+          DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
+          CHANNEL: ${{ github.ref_name }}
+          REVISION: ${{ github.sha }}
+        run: |
+          if [ -z "${DISPATCH_TOKEN}" ]; then
+            echo "HA_ADDON_REPO_DISPATCH_TOKEN is not set" >&2
+            exit 1
+          fi
+
+          curl -fsSL \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            https://api.github.com/repos/pyMC-dev/pyMC-HA-Add-on/dispatches \
+            -d "{\"event_type\":\"sync-upstream-channel\",\"client_payload\":{\"channel\":\"${CHANNEL}\",\"revision\":\"${REVISION}\"}}"
