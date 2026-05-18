@@ -5,6 +5,8 @@ ARG USER=repeater
 ARG GROUP=repeater
 ARG PUID=15888
 ARG PGID=15888
+ARG TARGETARCH
+ARG YQ_VERSION=v4.40.5
 
 ENV INSTALL_DIR=/opt/pymc_repeater \
     CONFIG_DIR=/etc/pymc_repeater \
@@ -28,6 +30,17 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     build-essential \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN arch="${TARGETARCH:-}" \
+    && if [ -z "${arch}" ]; then arch="$(uname -m)"; fi \
+    && case "${arch}" in \
+        amd64|x86_64) YQ_BINARY="yq_linux_amd64" ;; \
+        arm64|aarch64) YQ_BINARY="yq_linux_arm64" ;; \
+        arm|armv7|armv7l) YQ_BINARY="yq_linux_arm" ;; \
+        *) echo "Unsupported architecture for yq: ${arch}" >&2; exit 1 ;; \
+    esac \
+    && wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" \
+    && chmod +x /usr/local/bin/yq
 
 # Create the group and user in order to run without root privileges
 RUN groupadd --gid "$PGID" "$GROUP" \
