@@ -314,7 +314,7 @@ identities:
 #   - pymc_tcp      (pymc_usb firmware modem over Wi-Fi/TCP)
 #   - pymc_usb      (pymc_usb firmware modem over USB-CDC)
 #   - null/none     (disable radio hardware; daemon starts without RF I/O)
-radio_type: sx1262
+radio_type: null
 
 # CH341 USB-to-SPI adapter settings (only used when radio_type: sx1262_ch341)
 # NOTE: VID/PID are integers. Hex is also accepted in YAML, e.g. 0x1A86.
