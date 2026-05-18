@@ -5,9 +5,19 @@ on:
     branches:
       - main
       - dev
+  workflow_dispatch:
+    inputs:
+      image_repository:
+        description: "Docker image repository to publish to"
+        required: false
+        default: "pymcdev/pymc-repeater"
 
 jobs:
   docker:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.repository == 'rightup/pyMC_Repeater' ||
+      github.repository == 'yellowcooln/pyMC_Repeater'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,7 +56,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: pymcdev/pymc-repeater
+          images: ${{ github.event_name == 'workflow_dispatch' && inputs.image_repository || 'pymcdev/pymc-repeater' }}
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
@@ -67,6 +77,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Notify Home Assistant add-on repository
+        if: github.repository == 'rightup/pyMC_Repeater'
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
