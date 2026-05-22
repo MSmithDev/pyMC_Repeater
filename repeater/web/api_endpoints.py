@@ -137,6 +137,7 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/needs_setup - Check if repeater needs initial setup
 # GET    /api/hardware_options - Get available hardware configurations
 # GET    /api/radio_presets - Get radio preset configurations
+# GET    /api/serial_ports - Discover available serial/USB modem device paths
 # POST   /api/setup_wizard - Complete initial setup wizard
 
 # Backup & Restore
@@ -416,6 +417,50 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def serial_ports(self):
+        """Discover available serial/USB modem device paths."""
+        try:
+            devices = []
+
+            # Preferred: pyserial provides stable metadata (VID/PID, product, serial number).
+            try:
+                from serial.tools import list_ports
+
+                for port in list_ports.comports():
+                    label_parts = [port.device]
+                    if getattr(port, "description", None):
+                        label_parts.append(str(port.description))
+                    if getattr(port, "hwid", None) and str(port.hwid) != "n/a":
+                        label_parts.append(str(port.hwid))
+                    devices.append(
+                        {
+                            "device": str(port.device),
+                            "description": " - ".join(label_parts),
+                        }
+                    )
+            except Exception:
+                # Fallback for environments where pyserial is unavailable.
+                import glob
+
+                for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS*", "/dev/serial/by-id/*"):
+                    for dev in glob.glob(pattern):
+                        devices.append({"device": str(dev), "description": str(dev)})
+
+            # De-duplicate by device path while preserving the first description.
+            dedup = {}
+            for item in devices:
+                dev = item.get("device")
+                if dev and dev not in dedup:
+                    dedup[dev] = item
+
+            sorted_devices = sorted(dedup.values(), key=lambda x: x["device"])
+            return self._success(sorted_devices)
+        except Exception as e:
+            logger.error(f"Error discovering serial ports: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
@@ -681,6 +726,14 @@ class APIEndpoints:
     def stats(self):
         try:
             stats = self.stats_getter() if self.stats_getter else {}
+            # Include active radio configuration in stats so UI can hydrate
+            # directly from this endpoint without additional config fetches.
+            stats["radio_type"] = self.config.get("radio_type")
+            stats["sx1262"] = self.config.get("sx1262", {})
+            stats["ch341"] = self.config.get("ch341", {})
+            stats["kiss"] = self.config.get("kiss", {})
+            stats["pymc_usb"] = self.config.get("pymc_usb", {})
+            stats["pymc_tcp"] = self.config.get("pymc_tcp", {})
             stats["version"] = __version__
             try:
                 import pymc_core
