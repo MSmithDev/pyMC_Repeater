@@ -527,6 +527,61 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
 
+  /validate_config:
+    get:
+      tags: [System]
+      summary: Validate config.yaml before restart
+      description: Checks config syntax and required settings for the selected radio type.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Validation completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      valid:
+                        type: boolean
+                      blocked_restart:
+                        type: boolean
+                      errors:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            path:
+                              type: string
+                            message:
+                              type: string
+                      warnings:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            path:
+                              type: string
+                            message:
+                              type: string
+                      summary:
+                        type: object
+                        properties:
+                          error_count:
+                            type: integer
+                          warning_count:
+                            type: integer
+                      config_path:
+                        type: string
+                      message:
+                        type: string
+
   /openapi:
     get:
       tags: [System]
