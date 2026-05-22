@@ -112,7 +112,7 @@ pymc-repeater ($DEBIAN_VERSION) stable; urgency=medium
   * Git tag: $TAG
   * Commit: $(git rev-parse --short HEAD)
 
- -- Lloyd <lloyd@rightup.co.uk>  $CHANGELOG_DATE
+ -- Rightup <rightup@pymc.dev>  $CHANGELOG_DATE
 EOF
 
 log_info "Changelog updated with version $DEBIAN_VERSION"

@@ -1,7 +1,7 @@
 Source: pymc-repeater
 Section: net
 Priority: optional
-Maintainer: Lloyd <lloyd@rightup.co.uk>
+Maintainer: Rightup <rightup@pymc.dev>
 Build-Depends: debhelper-compat (= 13),
                dh-python,
                python3-all,

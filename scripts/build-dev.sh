@@ -74,7 +74,7 @@ pymc-repeater ($DEBIAN_VERSION) unstable; urgency=medium
   * Development build from git commit $(git rev-parse --short HEAD)
   * Version: $VERSION
 
- -- Lloyd <lloyd@rightup.co.uk>  $CHANGELOG_DATE
+ -- Rightup <rightup@pymc.dev>  $CHANGELOG_DATE
 EOF
 
 log_info "Changelog updated with version $DEBIAN_VERSION"

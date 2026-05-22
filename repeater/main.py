@@ -8,9 +8,10 @@ import socket
 import time
 
 from repeater.companion.utils import validate_companion_node_name, normalize_companion_identity_key
-from repeater.config import get_radio_for_board, load_config, save_config
+from repeater.config import NullRadio, get_radio_for_board, load_config, save_config
 from repeater.config_manager import ConfigManager
 from repeater.data_acquisition.glass_handler import GlassHandler
+from repeater.data_acquisition.gps_service import GPSService
 from repeater.engine import RepeaterHandler
 from repeater.handler_helpers import (
     AdvertHelper,
@@ -23,6 +24,7 @@ from repeater.handler_helpers import (
 )
 from repeater.identity_manager import IdentityManager
 from repeater.packet_router import PacketRouter
+from repeater.sensors import SensorManager
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 
 logger = logging.getLogger("RepeaterDaemon")
@@ -49,12 +51,16 @@ class RepeaterDaemon:
         self.path_helper = None
         self.protocol_request_helper = None
         self.glass_handler = None
+        self.gps_service = None
+        self.sensor_manager = None
         self.acl = None
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
         self._shutdown_started = False
         self._main_task = None
+        self.radio_status = "unknown"
+        self.radio_error = None
 
         log_level = config.get("logging", {}).get("level", "INFO")
         logging.basicConfig(
@@ -93,10 +99,33 @@ class RepeaterDaemon:
         #-----------------------------------------------
 
         if self.radio is None:
-            radio_type = self.config.get("radio_type", "sx1262")
+            radio_type_raw = self.config.get("radio_type")
+            radio_type = "none" if radio_type_raw is None else str(radio_type_raw)
+            radio_type_lower = radio_type.lower().strip()
+            radio_explicitly_disabled = radio_type_lower in (
+                "",
+                "none",
+                "null",
+                "disabled",
+                "off",
+                "no_radio",
+            )
             logger.info(f"Initializing radio hardware... (radio_type={radio_type})")
             try:
                 self.radio = get_radio_for_board(self.config)
+
+                if isinstance(self.radio, NullRadio):
+                    self.radio_status = "disabled" if radio_explicitly_disabled else "degraded"
+                    if self.radio_status == "disabled":
+                        self.radio_error = None
+                    else:
+                        self.radio_error = (
+                            self.radio_error
+                            or f"Radio type '{radio_type}' unavailable; running in no-radio mode"
+                        )
+                else:
+                    self.radio_status = "ok"
+                    self.radio_error = None
 
                 # KISS modem: schedule RX callbacks on the event loop for thread safety
                 if hasattr(self.radio, "set_event_loop"):
@@ -129,7 +158,14 @@ class RepeaterDaemon:
                 logger.info("Radio hardware initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize radio hardware: {e}")
-                raise RuntimeError("Repeater requires real LoRa hardware") from e
+                self.radio_status = "degraded"
+                self.radio_error = str(e)
+                logger.warning(
+                    "Radio type '%s' unavailable; starting in no-radio mode to keep service alive. "
+                    "Check radio configuration and hardware mapping.",
+                    radio_type,
+                )
+                self.radio = NullRadio()
 
         try:
             from pymc_core import LocalIdentity
@@ -262,6 +298,23 @@ class RepeaterDaemon:
             )
             logger.info("Config manager initialized")
 
+            self.sensor_manager = SensorManager(self.config)
+            self.sensor_manager.start()
+            if self.sensor_manager.get_summary().get("loaded", 0):
+                logger.info("Sensor manager initialized")
+            else:
+                logger.info("No configured sensors loaded")
+
+            self.gps_service = GPSService(
+                self.config,
+                location_update_callback=self._update_repeater_location_from_gps,
+            )
+            self.gps_service.start()
+            if self.config.get("gps", {}).get("enabled", False):
+                logger.info("GPS diagnostics initialized")
+            else:
+                logger.info("GPS diagnostics disabled")
+
             # Initialize text message helper with per-identity ACLs
             self.text_helper = TextHelper(
                 identity_manager=self.identity_manager,
@@ -278,6 +331,7 @@ class RepeaterDaemon:
                 ),  # For room server database
                 send_advert_callback=self.send_advert,  # For CLI advert command
             )
+            self.text_helper._loop = asyncio.get_running_loop()
 
             # Register default repeater identity for text messages
             self.text_helper.register_identity(
@@ -916,6 +970,16 @@ class RepeaterDaemon:
                 except Exception:
                     stats["public_key"] = None
 
+        if self.gps_service:
+            stats["gps"] = self.gps_service.get_summary()
+
+        if self.sensor_manager:
+            stats["sensors"] = self.sensor_manager.get_summary()
+
+        stats["radio_status"] = self.radio_status
+        if self.radio_error:
+            stats["radio_error"] = self.radio_error
+
         return stats
 
     async def _get_companion_stats(self, stats_type: int) -> dict:
@@ -991,6 +1055,13 @@ class RepeaterDaemon:
             node_name = repeater_config.get("node_name", "Repeater")
             latitude = repeater_config.get("latitude", 0.0)
             longitude = repeater_config.get("longitude", 0.0)
+            location_source = "config"
+
+            if self.gps_service:
+                location = self.gps_service.get_repeater_location()
+                latitude = location.get("latitude", latitude)
+                longitude = location.get("longitude", longitude)
+                location_source = str(location.get("source", location_source))
 
             flags = ADVERT_FLAG_IS_REPEATER | ADVERT_FLAG_HAS_NAME
 
@@ -1013,12 +1084,67 @@ class RepeaterDaemon:
                 self.repeater_handler.mark_seen(packet)
                 logger.debug("Marked own advert as seen in duplicate cache")
 
-            logger.info(f"Sent flood advert '{node_name}' at ({latitude: .6f}, {longitude: .6f})")
+            logger.info(
+                "Sent flood advert '%s' at (% .6f, % .6f) source=%s",
+                node_name,
+                latitude,
+                longitude,
+                location_source,
+            )
             return True
 
         except Exception as e:
             logger.error(f"Failed to send advert: {e}", exc_info=True)
             return False
+
+    def _update_repeater_location_from_gps(self, location: dict) -> bool:
+        """Persist the latest valid GPS fix as the repeater's advertised location."""
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        if latitude is None or longitude is None:
+            return False
+
+        repeater_config = self.config.setdefault("repeater", {})
+        current_latitude = repeater_config.get("latitude")
+        current_longitude = repeater_config.get("longitude")
+        try:
+            if (
+                current_latitude is not None
+                and current_longitude is not None
+                and abs(float(current_latitude) - float(latitude)) < 0.000001
+                and abs(float(current_longitude) - float(longitude)) < 0.000001
+            ):
+                return False
+        except (TypeError, ValueError):
+            pass
+
+        updates = {
+            "repeater": {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+            }
+        }
+        if self.config_manager:
+            result = self.config_manager.update_and_save(
+                updates=updates,
+                live_update=True,
+                live_update_sections=["repeater"],
+            )
+            if not result.get("success"):
+                logger.warning(
+                    "GPS location fix could not update repeater config: %s",
+                    result.get("error", "unknown error"),
+                )
+                return False
+        else:
+            repeater_config.update(updates["repeater"])
+
+        logger.info(
+            "Updated repeater location from GPS fix: latitude=%.6f longitude=%.6f",
+            latitude,
+            longitude,
+        )
+        return True
 
     def _signal_shutdown(self, sig, loop):
         """Handle SIGTERM/SIGINT by scheduling async shutdown."""
@@ -1076,6 +1202,20 @@ class RepeaterDaemon:
             except Exception as e:
                 logger.warning(f"Error stopping Glass handler: {e}")
 
+        # Stop sensor manager.
+        if self.sensor_manager:
+            try:
+                self.sensor_manager.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping sensor manager: {e}")
+
+        # Stop GPS diagnostics.
+        if self.gps_service:
+            try:
+                self.gps_service.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping GPS diagnostics: {e}")
+
         # Close storage publishers (MQTT/LetsMesh) to stop their worker threads.
         try:
             if self.repeater_handler and self.repeater_handler.storage:
@@ -1096,7 +1236,9 @@ class RepeaterDaemon:
 
         # Release CH341 USB device if in use
         try:
-            if self.config.get("radio_type", "sx1262").lower() == "sx1262_ch341":
+            radio_type_raw = self.config.get("radio_type")
+            radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower()
+            if radio_type == "sx1262_ch341":
                 from pymc_core.hardware.ch341.ch341_async import CH341Async
 
                 CH341Async.reset_instance()

@@ -15,7 +15,8 @@ from repeater.companion.identity_resolve import (
     find_companion_index,
     heal_companion_empty_names,
 )
-from repeater.config import update_unscoped_flood_policy
+from repeater.config import resolve_storage_dir, update_unscoped_flood_policy
+from repeater.service_utils import get_buildroot_image_info
 
 from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
@@ -41,9 +42,12 @@ logger = logging.getLogger("HTTPServer")
 
 # System
 # GET    /api/stats - Get system statistics
+# GET    /api/gps - Get local GPS diagnostics and parsed NMEA attributes
+# GET    /api/gps_stream - GPS diagnostics SSE stream
 # GET    /api/logs - Get system logs
 # GET    /api/hardware_stats - Get hardware statistics
 # GET    /api/hardware_processes - Get process information
+# GET    /api/validate_config - Validate config.yaml syntax and required settings
 # POST   /api/restart_service - Restart the repeater service
 # GET    /api/openapi - Get OpenAPI specification
 
@@ -56,6 +60,7 @@ logger = logging.getLogger("HTTPServer")
 # POST   /api/update_advert_rate_limit_config - Update advert rate limiting settings
 # GET    /api/mqtt_status - Get MQTT Observer connection status
 # POST   /api/update_mqtt_config - Update MQTT Observer configuration
+# GET    /api/broker_presets - List bundled MC2MQTT broker presets (waev, letsmesh, …)
 
 # Packets
 # GET    /api/packet_stats?hours=24 - Get packet statistics
@@ -131,8 +136,10 @@ logger = logging.getLogger("HTTPServer")
 
 # Setup Wizard
 # GET    /api/needs_setup - Check if repeater needs initial setup
+# GET    /api/site_info - Get site identification name (public, no auth required)
 # GET    /api/hardware_options - Get available hardware configurations
 # GET    /api/radio_presets - Get radio preset configurations
+# GET    /api/serial_ports - Discover available serial/USB modem device paths
 # POST   /api/setup_wizard - Complete initial setup wizard
 
 # Backup & Restore
@@ -293,6 +300,25 @@ class APIEndpoints:
         values = [v if v is not None else 0 for v in data_points]
         return [[timestamps_ms[i], values[i]] for i in range(min(len(values), len(timestamps_ms)))]
 
+    def _setup_status_from_config(self, config: dict) -> tuple[bool, dict]:
+        """Return whether first-run setup should still be available."""
+        node_name = config.get("repeater", {}).get("node_name", "")
+        has_default_name = node_name in ["mesh-repeater-01", ""]
+
+        admin_password = config.get("repeater", {}).get("security", {}).get("admin_password", "")
+        has_default_password = admin_password in ["admin123", ""]
+
+        radio_type_raw = config.get("radio_type")
+        radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
+        radio_not_configured = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
+
+        reasons = {
+            "default_name": has_default_name,
+            "default_password": has_default_password,
+            "radio_not_configured": radio_not_configured,
+        }
+        return has_default_name or has_default_password or radio_not_configured, reasons
+
     # ============================================================================
     # SETUP WIZARD ENDPOINTS
     # ============================================================================
@@ -302,29 +328,37 @@ class APIEndpoints:
     def needs_setup(self):
         """Check if the repeater needs initial setup configuration"""
         try:
+            # Prefer the on-disk config so this reflects current persisted state.
+            import yaml
+
             config = self.config
+            try:
+                with open(self._config_path, "r") as f:
+                    config = yaml.safe_load(f) or {}
+            except Exception:
+                # Fall back to in-memory config if file cannot be read.
+                pass
 
-            # Check for default values that indicate first-time setup
-            node_name = config.get("repeater", {}).get("node_name", "")
-            has_default_name = node_name in ["mesh-repeater-01", ""]
-
-            admin_password = (
-                config.get("repeater", {}).get("security", {}).get("admin_password", "")
-            )
-            has_default_password = admin_password in ["admin123", ""]
-
-            needs_setup = has_default_name or has_default_password
+            needs_setup, reasons = self._setup_status_from_config(config)
 
             return {
                 "needs_setup": needs_setup,
-                "reasons": {
-                    "default_name": has_default_name,
-                    "default_password": has_default_password,
-                },
+                "reasons": reasons,
             }
         except Exception as e:
             logger.error(f"Error checking setup status: {e}")
             return {"needs_setup": False, "error": str(e)}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def site_info(self):
+        """Return the site identification name (public endpoint, no auth required)."""
+        try:
+            site_name = self.config.get("web", {}).get("site_name", "") or ""
+            return {"success": True, "site_name": str(site_name)}
+        except Exception as e:
+            logger.error(f"Error serving site_info: {e}")
+            return {"success": True, "site_name": ""}
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -334,12 +368,7 @@ class APIEndpoints:
             import json
 
             # Check config-based location first, then development location
-            storage_dir_cfg = (
-                self.config.get("storage", {}).get("storage_dir")
-                or self.config.get("storage_dir")
-                or "/var/lib/pymc_repeater"
-            )
-            config_dir = Path(storage_dir_cfg)
+            config_dir = resolve_storage_dir(self.config, config_path=self._config_path)
             installed_path = config_dir / "radio-settings.json"
             dev_path = os.path.join(os.path.dirname(__file__), "..", "..", "radio-settings.json")
 
@@ -361,16 +390,6 @@ class APIEndpoints:
                             }
                         )
 
-            # Add MeshCore KISS modem option (serial TNC)
-            hardware_list.append(
-                {
-                    "key": "kiss",
-                    "name": "KISS modem (serial)",
-                    "description": "MeshCore KISS modem over serial – requires pyMC_core with KISS support",
-                    "config": {},
-                }
-            )
-
             return {"hardware": hardware_list}
         except Exception as e:
             logger.error(f"Error loading hardware options: {e}")
@@ -384,12 +403,7 @@ class APIEndpoints:
             import json
 
             # Check config-based location first, then development location
-            storage_dir_cfg = (
-                self.config.get("storage", {}).get("storage_dir")
-                or self.config.get("storage_dir")
-                or "/var/lib/pymc_repeater"
-            )
-            config_dir = Path(storage_dir_cfg)
+            config_dir = resolve_storage_dir(self.config, config_path=self._config_path)
             installed_path = config_dir / "radio-presets.json"
             dev_path = os.path.join(os.path.dirname(__file__), "..", "..", "radio-presets.json")
 
@@ -416,12 +430,74 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def serial_ports(self):
+        """Discover available serial/USB modem device paths."""
+        try:
+            devices = []
+
+            # Preferred: pyserial provides stable metadata (VID/PID, product, serial number).
+            try:
+                from serial.tools import list_ports
+
+                for port in list_ports.comports():
+                    label_parts = [port.device]
+                    if getattr(port, "description", None):
+                        label_parts.append(str(port.description))
+                    if getattr(port, "hwid", None) and str(port.hwid) != "n/a":
+                        label_parts.append(str(port.hwid))
+                    devices.append(
+                        {
+                            "device": str(port.device),
+                            "description": " - ".join(label_parts),
+                        }
+                    )
+            except Exception:
+                # Fallback for environments where pyserial is unavailable.
+                import glob
+
+                for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS*", "/dev/serial/by-id/*"):
+                    for dev in glob.glob(pattern):
+                        devices.append({"device": str(dev), "description": str(dev)})
+
+            # De-duplicate by device path while preserving the first description.
+            dedup = {}
+            for item in devices:
+                dev = item.get("device")
+                if dev and dev not in dedup:
+                    dedup[dev] = item
+
+            sorted_devices = sorted(dedup.values(), key=lambda x: x["device"])
+            return self._success(sorted_devices)
+        except Exception as e:
+            logger.error(f"Error discovering serial ports: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
         try:
             self._require_post()
             data = cherrypy.request.json
+
+            import yaml
+
+            # Setup wizard is first-run only. After setup, use /auth/change_password
+            # and /api/update_radio_config for subsequent changes.
+            try:
+                with open(self._config_path, "r") as f:
+                    current_config = yaml.safe_load(f) or {}
+            except Exception:
+                current_config = self.config or {}
+
+            needs_setup, _ = self._setup_status_from_config(current_config)
+            if not needs_setup:
+                cherrypy.response.status = 403
+                return {
+                    "success": False,
+                    "error": "Setup is already complete. Use authenticated endpoints for configuration changes.",
+                }
 
             # Validate required fields
             node_name = data.get("node_name", "").strip()
@@ -445,12 +521,7 @@ class APIEndpoints:
 
             import json
 
-            storage_dir_cfg = (
-                self.config.get("storage", {}).get("storage_dir")
-                or self.config.get("storage_dir")
-                or "/var/lib/pymc_repeater"
-            )
-            config_dir = Path(storage_dir_cfg)
+            config_dir = resolve_storage_dir(self.config, config_path=self._config_path)
             installed_path = config_dir / "radio-settings.json"
             dev_path = os.path.join(os.path.dirname(__file__), "..", "..", "radio-settings.json")
             hardware_file = str(installed_path) if installed_path.exists() else dev_path
@@ -467,8 +538,6 @@ class APIEndpoints:
                     return {"success": False, "error": f"Hardware configuration not found: {hardware_key}"}
             else:
                 hw_config = {}
-
-            import yaml
 
             # Read current config first so we can update it
             with open(self._config_path, "r") as f:
@@ -493,15 +562,75 @@ class APIEndpoints:
             config_yaml["radio"]["bandwidth"] = int(bw_khz * 1000)
             config_yaml["radio"]["coding_rate"] = int(radio_preset.get("coding_rate", 5))
 
+            tx_power_raw = radio_preset.get("tx_power")
+            tx_power_preset = None
+            if tx_power_raw not in (None, ""):
+                try:
+                    tx_power_preset = int(tx_power_raw)
+                except (TypeError, ValueError):
+                    return {"success": False, "error": "TX power must be an integer"}
+                if tx_power_preset < -9 or tx_power_preset > 22:
+                    return {
+                        "success": False,
+                        "error": "TX power must be between -9 and +22 dBm",
+                    }
+
             if hardware_key == "kiss":
                 # KISS modem: set radio_type and kiss section (port/baud from request or defaults)
                 config_yaml["radio_type"] = "kiss"
                 kiss_port = (data.get("kiss_port") or "").strip() or "/dev/ttyUSB0"
                 kiss_baud = int(data.get("kiss_baud_rate", data.get("kiss_baud", 115200)))
                 config_yaml["kiss"] = {"port": kiss_port, "baud_rate": kiss_baud}
-                config_yaml["radio"]["tx_power"] = int(radio_preset.get("tx_power", 14))
+                config_yaml["radio"]["tx_power"] = tx_power_preset if tx_power_preset is not None else 14
                 if "preamble_length" not in config_yaml["radio"]:
                     config_yaml["radio"]["preamble_length"] = 17
+            elif hardware_key == "pymc_usb":
+                # pymc_usb modem: external SX1262 board over USB-CDC.
+                # Accept pymc_usb_port / pymc_usb_baudrate from the request body
+                # (mirrors the KISS pattern) so a future SPA can expose inputs;
+                # fall back to /dev/ttyACM0 at 921600 baud, which matches the
+                # firmware default and the typical USB-CDC modem device on Linux.
+                config_yaml["radio_type"] = "pymc_usb"
+                usb_port = (data.get("pymc_usb_port") or "").strip() or "/dev/ttyACM0"
+                usb_baud = int(data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)))
+                pymc_usb_section = config_yaml.setdefault("pymc_usb", {})
+                pymc_usb_section["port"] = usb_port
+                pymc_usb_section["baudrate"] = usb_baud
+                pymc_usb_section.setdefault("lbt_enabled", True)
+                pymc_usb_section.setdefault("lbt_max_attempts", 5)
+                if tx_power_preset is not None:
+                    config_yaml["radio"]["tx_power"] = tx_power_preset
+                elif "tx_power" in hw_config:
+                    config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
+                if "preamble_length" in hw_config:
+                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 16)
+            elif hardware_key == "pymc_tcp":
+                # pymc_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
+                # 'host' has no sensible default — must be the modem's LAN address or
+                # mDNS name. Accept it from the request body if the SPA provides it,
+                # otherwise write a clearly-placeholder hostname so the file is valid
+                # YAML and the user gets a startup error pointing them at the right
+                # section to edit (see config.py: ValueError 'Missing host …').
+                config_yaml["radio_type"] = "pymc_tcp"
+                tcp_host = (data.get("pymc_tcp_host") or "").strip() or "REPLACE_WITH_MODEM_HOST"
+                tcp_port = int(data.get("pymc_tcp_port", 5055))
+                pymc_tcp_section = config_yaml.setdefault("pymc_tcp", {})
+                pymc_tcp_section["host"] = tcp_host
+                pymc_tcp_section["port"] = tcp_port
+                tcp_token = data.get("pymc_tcp_token")
+                if tcp_token is not None:
+                    pymc_tcp_section["token"] = str(tcp_token)
+                else:
+                    pymc_tcp_section.setdefault("token", "")
+                pymc_tcp_section.setdefault("connect_timeout", 5.0)
+                pymc_tcp_section.setdefault("lbt_enabled", True)
+                pymc_tcp_section.setdefault("lbt_max_attempts", 5)
+                if tx_power_preset is not None:
+                    config_yaml["radio"]["tx_power"] = tx_power_preset
+                elif "tx_power" in hw_config:
+                    config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
+                if "preamble_length" in hw_config:
+                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 16)
             else:
                 # SX1262 / sx1262_ch341: radio_type and optional CH341 from hw_config
                 if "radio_type" in hw_config:
@@ -520,7 +649,9 @@ class APIEndpoints:
                     if pid is not None:
                         config_yaml["ch341"]["pid"] = pid
 
-                if "tx_power" in hw_config:
+                if tx_power_preset is not None:
+                    config_yaml["radio"]["tx_power"] = tx_power_preset
+                elif "tx_power" in hw_config:
                     config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
                 if "preamble_length" in hw_config:
                     config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 17)
@@ -543,6 +674,8 @@ class APIEndpoints:
                     config_yaml["sx1262"]["rxen_pin"] = hw_config.get("rxen_pin", -1)
                 if "en_pin" in hw_config:
                     config_yaml["sx1262"]["en_pin"] = hw_config.get("en_pin", -1)
+                if "en_pins" in hw_config:
+                    config_yaml["sx1262"]["en_pins"] = hw_config.get("en_pins", [])
                 if "cs_pin" in hw_config:
                     config_yaml["sx1262"]["cs_pin"] = hw_config.get("cs_pin", -1)
                 if "txled_pin" in hw_config:
@@ -586,7 +719,7 @@ class APIEndpoints:
             result_config = {
                 "node_name": node_name,
                 "hardware": hardware_key,
-                "radio_type": config_yaml.get("radio_type", "sx1262"),
+                "radio_type": config_yaml.get("radio_type"),
                 "frequency": freq_mhz,
                 "spreading_factor": radio_preset.get("spreading_factor"),
                 "bandwidth": radio_preset.get("bandwidth"),
@@ -595,6 +728,15 @@ class APIEndpoints:
             if hardware_key == "kiss":
                 result_config["kiss_port"] = config_yaml.get("kiss", {}).get("port")
                 result_config["kiss_baud_rate"] = config_yaml.get("kiss", {}).get("baud_rate")
+            elif hardware_key == "pymc_usb":
+                pymc_usb_cfg = config_yaml.get("pymc_usb", {})
+                result_config["pymc_usb_port"] = pymc_usb_cfg.get("port")
+                result_config["pymc_usb_baudrate"] = pymc_usb_cfg.get("baudrate")
+            elif hardware_key == "pymc_tcp":
+                pymc_tcp_cfg = config_yaml.get("pymc_tcp", {})
+                result_config["pymc_tcp_host"] = pymc_tcp_cfg.get("host")
+                result_config["pymc_tcp_port"] = pymc_tcp_cfg.get("port")
+                # token deliberately omitted from response (sensitive)
             return {
                 "success": True,
                 "message": "Setup completed successfully. Service is restarting...",
@@ -616,6 +758,15 @@ class APIEndpoints:
     def stats(self):
         try:
             stats = self.stats_getter() if self.stats_getter else {}
+            # Include active radio configuration in stats so UI can hydrate
+            # directly from this endpoint without additional config fetches.
+            stats["radio_type"] = self.config.get("radio_type")
+            stats["sx1262"] = self.config.get("sx1262", {})
+            stats["ch341"] = self.config.get("ch341", {})
+            stats["kiss"] = self.config.get("kiss", {})
+            stats["pymc_usb"] = self.config.get("pymc_usb", {})
+            stats["pymc_tcp"] = self.config.get("pymc_tcp", {})
+            stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
                 import pymc_core
@@ -623,10 +774,144 @@ class APIEndpoints:
                 stats["core_version"] = pymc_core.__version__
             except ImportError:
                 stats["core_version"] = "unknown"
+            image_info = get_buildroot_image_info()
+            if image_info:
+                if image_info.get("image_name"):
+                    stats["image_name"] = image_info["image_name"]
+                if image_info.get("image_version"):
+                    stats["image_version"] = image_info["image_version"]
             return stats
         except Exception as e:
             logger.error(f"Error serving stats: {e}")
             return {"error": str(e)}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def gps(self):
+        """Get full local GPS diagnostics and parsed NMEA attributes."""
+        try:
+            gps_service = getattr(self.daemon_instance, "gps_service", None)
+            if gps_service:
+                return self._success(gps_service.get_snapshot())
+
+            return self._success(
+                {
+                    "enabled": False,
+                    "running": False,
+                    "source": self.config.get("gps", {}),
+                    "status": {
+                        "state": "disabled",
+                        "fix_valid": False,
+                        "stale": True,
+                        "age_seconds": None,
+                        "last_update": None,
+                        "last_error": "GPS service is not initialized",
+                    },
+                    "fix": {
+                        "valid": False,
+                        "status": None,
+                        "quality": None,
+                        "quality_label": "no fix",
+                        "gsa_fix_type": None,
+                        "gsa_fix_type_label": None,
+                    },
+                    "position": {
+                        "latitude": None,
+                        "longitude": None,
+                        "altitude_m": None,
+                        "geoid_separation_m": None,
+                    },
+                    "motion": {
+                        "speed_knots": None,
+                        "speed_kmh": None,
+                        "course_degrees": None,
+                        "magnetic_variation_degrees": None,
+                    },
+                    "accuracy": {"hdop": None, "pdop": None, "vdop": None},
+                    "time": {"utc_time": None, "date": None, "datetime_utc": None},
+                    "location_update": {
+                        "enabled": False,
+                        "state": "disabled",
+                        "last_attempt": None,
+                        "last_success": None,
+                        "last_error": None,
+                        "last_latitude": None,
+                        "last_longitude": None,
+                        "interval_seconds": None,
+                    },
+                    "satellites": {
+                        "used_count": None,
+                        "used_prns": [],
+                        "in_view_count": None,
+                        "in_view": [],
+                        "snr": {"min": None, "max": None, "avg": None},
+                    },
+                    "nmea": {
+                        "last_sentence": None,
+                        "last_sentence_type": None,
+                        "last_talker": None,
+                        "seen_sentence_types": [],
+                        "sentence_counters": {},
+                        "valid_checksum_count": 0,
+                        "invalid_checksum_count": 0,
+                        "missing_checksum_count": 0,
+                        "recent_sentences": [],
+                    },
+                    "raw_attributes": {},
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error serving GPS diagnostics: {e}", exc_info=True)
+            return self._error(e)
+
+    @cherrypy.expose
+    def gps_stream(self):
+        """Server-Sent Events stream for GPS diagnostics snapshots."""
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+
+        def generate():
+            last_snapshot_json: Optional[str] = None
+            last_keepalive = time.time()
+
+            try:
+                yield (
+                    f"data: {json.dumps({'type': 'connected', 'message': 'Connected to GPS stream'})}"
+                    "\n\n"
+                )
+
+                while True:
+                    response = self.gps()
+                    if response.get("success"):
+                        snapshot = response.get("data")
+                        snapshot_json = json.dumps(snapshot, sort_keys=True, default=str)
+
+                        if snapshot_json != last_snapshot_json:
+                            yield (
+                                f"data: {json.dumps({'type': 'snapshot', 'data': snapshot})}"
+                                "\n\n"
+                            )
+                            last_snapshot_json = snapshot_json
+                            last_keepalive = time.time()
+                        elif (time.time() - last_keepalive) >= 15:
+                            yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+                            last_keepalive = time.time()
+                    else:
+                        yield (
+                            f"data: {json.dumps({'type': 'error', 'error': response.get('error', 'GPS stream error')})}"
+                            "\n\n"
+                        )
+
+                    time.sleep(1.0)
+            except GeneratorExit:
+                logger.debug("GPS SSE stream closed by client")
+            except Exception as exc:
+                logger.error(f"GPS SSE stream error: {exc}", exc_info=True)
+
+        return generate()
+
+    gps_stream._cp_config = {"response.stream": True}
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -1037,6 +1322,60 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def broker_presets(self):
+        """List bundled MC2MQTT broker presets.
+
+        GET /api/broker_presets
+
+        Returns the sorted list of ``repeater/presets/*.yaml`` packaged
+        with this build, in a UI-ready shape so the admin frontend's
+        "From Template" dropdown does not need to bundle its own copy
+        of the broker catalogue.
+
+        Response:
+            {
+              "success": true,
+              "data": [
+                {
+                  "id": "waev",                # preset filename stem
+                  "name": "Waev",              # YAML display_name, or titlecased id
+                  "website": "https://waev.app",  # optional, omitted if absent
+                  "brokers": [ ... raw broker dicts from the YAML ... ]
+                },
+                ...
+              ]
+            }
+
+        Unauthenticated by design - the response contains only public
+        broker hostnames and TLS hints, mirroring the access policy on
+        ``mqtt_status``.
+        """
+        self._set_cors_headers()
+        try:
+            # Imported lazily so a broken/missing yaml in the presets
+            # package never blocks process startup; the loader logs and
+            # skips bad files.
+            from repeater.presets import get_preset, list_presets
+
+            data = []
+            for preset_id in list_presets():
+                preset = get_preset(preset_id) or {}
+                entry = {
+                    "id": preset_id,
+                    "name": preset.get("display_name") or preset_id.title(),
+                    "brokers": list(preset.get("brokers", [])),
+                }
+                website = preset.get("website")
+                if website:
+                    entry["website"] = website
+                data.append(entry)
+            return self._success(data)
+        except Exception as e:
+            logger.error(f"Error listing broker presets: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def update_mqtt_config(self):
         """Update MQTT Observer configuration.
@@ -1085,6 +1424,13 @@ class APIEndpoints:
                 for i, b in enumerate(brokers):
                     if not isinstance(b, dict):
                         return self._error(f"Broker at index {i} must be an object")
+
+                    # Bundled preset reference: {preset: <name>}. Pass through
+                    # unchanged - the MQTT handler expands it on next start.
+                    if "preset" in b and "name" not in b:
+                        validated.append({"preset": str(b["preset"]).strip()})
+                        continue
+
                     for field in ("name", "host", "port", "format"):
                         if not b.get(field, ""):
                             return self._error(f"Broker at index {i} missing required field: {field}")
@@ -1173,6 +1519,280 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error in restart_service endpoint: {e}", exc_info=True)
             return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def validate_config(self):
+        """Validate config.yaml syntax and required settings without restarting."""
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        if cherrypy.request.method != "GET":
+            cherrypy.response.status = 405
+            cherrypy.response.headers["Allow"] = "GET"
+            raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires GET.")
+
+        try:
+            import yaml
+
+            errors = []
+            warnings = []
+
+            def add_error(path: str, message: str):
+                errors.append({"path": path, "message": message})
+
+            def add_warning(path: str, message: str):
+                warnings.append({"path": path, "message": message})
+
+            def as_int(value, path: str):
+                if isinstance(value, bool):
+                    add_error(path, "must be an integer")
+                    return None
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    add_error(path, "must be an integer")
+                    return None
+
+            def as_float(value, path: str):
+                if isinstance(value, bool):
+                    add_error(path, "must be a number")
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    add_error(path, "must be a number")
+                    return None
+
+            try:
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    config_yaml = yaml.safe_load(f)
+            except FileNotFoundError:
+                add_error("config", f"Configuration file not found: {self._config_path}")
+                config_yaml = None
+            except yaml.YAMLError as e:
+                mark = getattr(e, "problem_mark", None)
+                if mark is not None:
+                    add_error(
+                        "config",
+                        f"YAML syntax error at line {mark.line + 1}, column {mark.column + 1}: {e}",
+                    )
+                else:
+                    add_error("config", f"YAML syntax error: {e}")
+                config_yaml = None
+            except Exception as e:
+                add_error("config", f"Failed to read configuration: {e}")
+                config_yaml = None
+
+            if config_yaml is not None and not isinstance(config_yaml, dict):
+                add_error("config", "Top-level YAML value must be a mapping/object")
+                config_yaml = None
+
+            if isinstance(config_yaml, dict):
+                repeater = config_yaml.get("repeater")
+                if not isinstance(repeater, dict):
+                    add_error("repeater", "Missing required section 'repeater'")
+                    repeater = {}
+
+                node_name = (repeater.get("node_name") if isinstance(repeater, dict) else "") or ""
+                node_name = str(node_name).strip()
+                if not node_name:
+                    add_error("repeater.node_name", "Node name is required")
+                elif len(node_name.encode("utf-8")) > 31:
+                    add_error("repeater.node_name", "Node name too long (max 31 bytes in UTF-8)")
+
+                security = repeater.get("security") if isinstance(repeater, dict) else None
+                if not isinstance(security, dict):
+                    add_error("repeater.security", "Missing required section 'repeater.security'")
+                    security = {}
+
+                admin_password = (security.get("admin_password") if isinstance(security, dict) else "") or ""
+                if not str(admin_password).strip():
+                    add_error("repeater.security.admin_password", "Admin password is required")
+
+                radio_type_raw = config_yaml.get("radio_type")
+                radio_type = "" if radio_type_raw is None else str(radio_type_raw).strip().lower()
+                if radio_type == "kiss-modem":
+                    radio_type = "kiss"
+
+                known_radio_types = {
+                    "sx1262",
+                    "sx1262_ch341",
+                    "kiss",
+                    "pymc_tcp",
+                    "pymc_usb",
+                    "none",
+                    "null",
+                    "disabled",
+                    "off",
+                    "no_radio",
+                    "",
+                }
+                if radio_type not in known_radio_types:
+                    add_error(
+                        "radio_type",
+                        "Unsupported radio_type. Supported: sx1262, sx1262_ch341, kiss, pymc_tcp, pymc_usb, none/null",
+                    )
+
+                radio_disabled = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
+                radio = config_yaml.get("radio")
+
+                if not radio_disabled:
+                    if not isinstance(radio, dict):
+                        add_error("radio", "Missing required section 'radio'")
+                        radio = {}
+
+                    frequency = as_float((radio or {}).get("frequency"), "radio.frequency")
+                    if frequency is None:
+                        add_error("radio.frequency", "Frequency is required")
+                    elif frequency < 100_000_000 or frequency > 1_000_000_000:
+                        add_error("radio.frequency", "Frequency must be 100-1000 MHz")
+
+                    bandwidth = as_int((radio or {}).get("bandwidth"), "radio.bandwidth")
+                    valid_bw = [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]
+                    if bandwidth is None:
+                        add_error("radio.bandwidth", "Bandwidth is required")
+                    elif bandwidth not in valid_bw:
+                        add_error("radio.bandwidth", f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz")
+
+                    spreading_factor = as_int((radio or {}).get("spreading_factor"), "radio.spreading_factor")
+                    if spreading_factor is None:
+                        add_error("radio.spreading_factor", "Spreading factor is required")
+                    elif spreading_factor < 5 or spreading_factor > 12:
+                        add_error("radio.spreading_factor", "Spreading factor must be 5-12")
+
+                    coding_rate = as_int((radio or {}).get("coding_rate"), "radio.coding_rate")
+                    if coding_rate is None:
+                        add_error("radio.coding_rate", "Coding rate is required")
+                    elif coding_rate < 5 or coding_rate > 8:
+                        add_error("radio.coding_rate", "Coding rate must be 5-8 (for 4/5 to 4/8)")
+
+                    tx_power = as_int((radio or {}).get("tx_power"), "radio.tx_power")
+                    if tx_power is None:
+                        add_error("radio.tx_power", "TX power is required")
+                    elif tx_power < -9 or tx_power > 30:
+                        add_error("radio.tx_power", "TX power must be between -9 and +30 dBm")
+
+                    preamble_length = as_int((radio or {}).get("preamble_length"), "radio.preamble_length")
+                    if preamble_length is None:
+                        add_error("radio.preamble_length", "Preamble length is required")
+                    elif preamble_length <= 0:
+                        add_error("radio.preamble_length", "Preamble length must be greater than zero")
+
+                if radio_type in ("sx1262", "sx1262_ch341"):
+                    sx1262_cfg = config_yaml.get("sx1262")
+                    if not isinstance(sx1262_cfg, dict):
+                        add_error("sx1262", "Missing required section 'sx1262'")
+                        sx1262_cfg = {}
+
+                    required_sx1262_keys = [
+                        "bus_id",
+                        "cs_id",
+                        "cs_pin",
+                        "reset_pin",
+                        "busy_pin",
+                        "irq_pin",
+                        "txen_pin",
+                        "rxen_pin",
+                    ]
+                    for key in required_sx1262_keys:
+                        value = sx1262_cfg.get(key) if isinstance(sx1262_cfg, dict) else None
+                        parsed = as_int(value, f"sx1262.{key}")
+                        if parsed is None:
+                            add_error(f"sx1262.{key}", f"Missing or invalid required setting '{key}'")
+
+                    en_pins = sx1262_cfg.get("en_pins") if isinstance(sx1262_cfg, dict) else None
+                    if en_pins is not None:
+                        if not isinstance(en_pins, list):
+                            add_error("sx1262.en_pins", "en_pins must be a list of integers")
+                        else:
+                            for idx, pin in enumerate(en_pins):
+                                if as_int(pin, f"sx1262.en_pins[{idx}]") is None:
+                                    add_error(
+                                        f"sx1262.en_pins[{idx}]",
+                                        "Each en_pins entry must be an integer",
+                                    )
+
+                if radio_type == "sx1262_ch341":
+                    ch341_cfg = config_yaml.get("ch341")
+                    if not isinstance(ch341_cfg, dict):
+                        add_error("ch341", "Missing required section 'ch341' for radio_type sx1262_ch341")
+                        ch341_cfg = {}
+                    for key in ("vid", "pid"):
+                        value = ch341_cfg.get(key) if isinstance(ch341_cfg, dict) else None
+                        parsed = as_int(value, f"ch341.{key}")
+                        if parsed is None:
+                            add_error(f"ch341.{key}", f"Missing or invalid required setting '{key}'")
+
+                if radio_type == "kiss":
+                    kiss_cfg = config_yaml.get("kiss")
+                    if not isinstance(kiss_cfg, dict):
+                        add_error("kiss", "Missing required section 'kiss' for radio_type kiss")
+                        kiss_cfg = {}
+                    port = (kiss_cfg.get("port") if isinstance(kiss_cfg, dict) else "") or ""
+                    if not str(port).strip():
+                        add_error("kiss.port", "KISS port is required")
+                    baud = as_int((kiss_cfg or {}).get("baud_rate"), "kiss.baud_rate")
+                    if baud is None:
+                        add_error("kiss.baud_rate", "KISS baud_rate is required")
+                    elif baud <= 0:
+                        add_error("kiss.baud_rate", "KISS baud_rate must be greater than zero")
+
+                if radio_type == "pymc_usb":
+                    usb_cfg = config_yaml.get("pymc_usb")
+                    if not isinstance(usb_cfg, dict):
+                        add_error("pymc_usb", "Missing required section 'pymc_usb' for radio_type pymc_usb")
+                        usb_cfg = {}
+                    port = (usb_cfg.get("port") if isinstance(usb_cfg, dict) else "") or ""
+                    if not str(port).strip():
+                        add_error("pymc_usb.port", "pymc_usb.port is required")
+                    baud = as_int((usb_cfg or {}).get("baudrate"), "pymc_usb.baudrate")
+                    if baud is not None and baud <= 0:
+                        add_error("pymc_usb.baudrate", "pymc_usb.baudrate must be greater than zero")
+
+                if radio_type == "pymc_tcp":
+                    tcp_cfg = config_yaml.get("pymc_tcp")
+                    if not isinstance(tcp_cfg, dict):
+                        add_error("pymc_tcp", "Missing required section 'pymc_tcp' for radio_type pymc_tcp")
+                        tcp_cfg = {}
+                    host = (tcp_cfg.get("host") if isinstance(tcp_cfg, dict) else "") or ""
+                    host_str = str(host).strip()
+                    if not host_str:
+                        add_error("pymc_tcp.host", "pymc_tcp.host is required")
+                    elif host_str == "REPLACE_WITH_MODEM_HOST":
+                        add_error("pymc_tcp.host", "Replace placeholder host with your modem hostname or IP")
+                    port = as_int((tcp_cfg or {}).get("port"), "pymc_tcp.port")
+                    if port is None:
+                        add_error("pymc_tcp.port", "pymc_tcp.port is required")
+                    elif port < 1 or port > 65535:
+                        add_error("pymc_tcp.port", "pymc_tcp.port must be 1-65535")
+
+                if radio_disabled:
+                    add_warning("radio_type", "Radio is disabled (radio_type none/null/off)")
+
+            valid = len(errors) == 0
+            return self._success(
+                {
+                    "valid": valid,
+                    "blocked_restart": not valid,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "summary": {
+                        "error_count": len(errors),
+                        "warning_count": len(warnings),
+                    },
+                    "config_path": self._config_path,
+                    "message": "Configuration is valid" if valid else "Configuration has validation errors",
+                }
+            )
+
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error validating configuration: {e}", exc_info=True)
+            return self._error(str(e))
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -2136,31 +2756,59 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def adverts_by_contact_type(self, contact_type=None, limit=None, hours=None):
+    def adverts_by_contact_type(self, contact_type=None, limit=None, offset=None, hours=None):
 
         try:
             if not contact_type:
                 return self._error("contact_type parameter is required")
 
             limit_int = int(limit) if limit is not None else None
+            offset_int = int(offset) if offset is not None else None
             hours_int = int(hours) if hours is not None else None
 
             storage = self._get_storage()
             adverts = storage.sqlite_handler.get_adverts_by_contact_type(
-                contact_type=contact_type, limit=limit_int, hours=hours_int
+                contact_type=contact_type, limit=limit_int, offset=offset_int, hours=hours_int
             )
 
             return self._success(
                 adverts,
                 count=len(adverts),
                 contact_type=contact_type,
-                filters={"contact_type": contact_type, "limit": limit_int, "hours": hours_int},
+                filters={"contact_type": contact_type, "limit": limit_int, "offset": offset_int, "hours": hours_int},
             )
 
         except ValueError as e:
             return self._error(f"Invalid parameter format: {e}")
         except Exception as e:
             logger.error(f"Error getting adverts by contact type: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def adverts_count_by_contact_type(self, contact_type=None, hours=None):
+        """Get the total count of adverts for a specific contact type."""
+        try:
+            if not contact_type:
+                return self._error("contact_type parameter is required")
+
+            hours_int = int(hours) if hours is not None else None
+
+            storage = self._get_storage()
+            count = storage.sqlite_handler.get_adverts_count_by_contact_type(
+                contact_type=contact_type, hours=hours_int
+            )
+
+            return self._success(
+                {"count": count},
+                contact_type=contact_type,
+                hours=hours_int,
+            )
+
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting adverts count by contact type: {e}")
             return self._error(e)
 
     @cherrypy.expose
@@ -2430,6 +3078,8 @@ class APIEndpoints:
             # 0 = 1-byte (legacy), 1 = 2-byte, 2 = 3-byte
             path_hash_mode = self.config.get("mesh", {}).get("path_hash_mode", 0)
             byte_count = {0: 1, 1: 2, 2: 3}.get(path_hash_mode, 1)
+
+            trace_flags = {1: 0x00, 2: 0x01}.get(byte_count, 0x00)
             hex_chars = byte_count * 2
             max_hash = (1 << (byte_count * 8)) - 1
 
@@ -2464,7 +3114,7 @@ class APIEndpoints:
 
             path_bytes = list(target_hash.to_bytes(byte_count, "big"))
             packet = PacketBuilder.create_trace(
-                tag=trace_tag, auth_code=0x12345678, flags=0x00, path=path_bytes
+                tag=trace_tag, auth_code=0x12345678, flags=trace_flags, path=path_bytes
             )
 
             # Wait for response with timeout
@@ -4645,8 +5295,21 @@ class APIEndpoints:
 
             # Sections we allow to be imported
             ALLOWED_SECTIONS = {
-                "repeater", "mesh", "radio", "identities", "delays",
-                "ch341", "web", "letsmesh", "glass", "logging", "radio_type",
+                "repeater",
+                "mesh",
+                "radio",
+                "sx1262",
+                "ch341",
+                "kiss",
+                "pymc_usb",
+                "pymc_tcp",
+                "identities",
+                "delays",
+                "web",
+                "letsmesh",
+                "glass",
+                "logging",
+                "radio_type",
             }
 
             updated_sections = []
@@ -4690,7 +5353,15 @@ class APIEndpoints:
                                 existing = cur_by_name.get(entry.get("name"), {})
                                 entry["identity_key"] = existing.get("identity_key", "")
 
-                if section == "radio":
+                if section in {
+                    "radio",
+                    "sx1262",
+                    "ch341",
+                    "kiss",
+                    "pymc_usb",
+                    "pymc_tcp",
+                    "radio_type",
+                }:
                     restart_required = True
 
                 if section == "radio_type":

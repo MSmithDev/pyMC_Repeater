@@ -6,14 +6,18 @@ Provides functions for service control operations like restart.
 import logging
 import os
 import subprocess
-from typing import Tuple
+import threading
+import time
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("ServiceUtils")
 INIT_SCRIPT = "/etc/init.d/S80pymc-repeater"
+BUILDROOT_METADATA_PATH = "/etc/pymc-image-build-id"
+_CONTAINER_RESTART_DELAY_SECONDS = 1.0
 
 
 def is_buildroot() -> bool:
-    if os.path.exists("/etc/pymc-image-build-id"):
+    if os.path.exists(BUILDROOT_METADATA_PATH):
         return True
     if os.path.exists("/etc/os-release"):
         try:
@@ -22,6 +26,70 @@ def is_buildroot() -> bool:
         except OSError:
             return False
     return False
+
+
+def get_buildroot_image_info() -> Dict[str, str]:
+    info: Dict[str, str] = {}
+
+    try:
+        with open(BUILDROOT_METADATA_PATH, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                info[key.strip()] = value.strip()
+    except OSError:
+        return {}
+
+    return info
+
+
+def get_buildroot_image_version() -> Optional[str]:
+    return get_buildroot_image_info().get("image_version")
+
+
+def is_container() -> bool:
+    """Detect common Docker/LXC/containerized environments."""
+    if os.path.exists("/.dockerenv") or os.environ.get("container"):
+        return True
+
+    try:
+        with open("/proc/1/environ", "rb") as handle:
+            if b"container=" in handle.read():
+                return True
+    except (OSError, PermissionError):
+        pass
+
+    try:
+        with open("/proc/1/cgroup", "r", encoding="utf-8") as handle:
+            cgroup_data = handle.read()
+            if any(token in cgroup_data for token in ("docker", "containerd", "kubepods", "lxc")):
+                return True
+    except OSError:
+        pass
+
+    return os.path.exists("/run/host/container-manager")
+
+
+def _schedule_container_exit(delay_seconds: float = _CONTAINER_RESTART_DELAY_SECONDS) -> None:
+    """Exit the current process shortly after returning success to the caller."""
+
+    def _exit_process() -> None:
+        time.sleep(delay_seconds)
+        logger.warning("Exiting repeater process to trigger container restart")
+        os._exit(0)
+
+    threading.Thread(target=_exit_process, name="container-restart-exit", daemon=True).start()
+
+
+def get_container_restart_message() -> str:
+    """Return the user-facing restart message for containerized installs."""
+    return (
+        "Container restart initiated. "
+        "If you are running pyMC Repeater via Docker or Home Assistant, pull or rebuild "
+        "a newer image for packaged image updates to take effect."
+    )
 
 
 def restart_service() -> Tuple[bool, str]:
@@ -36,6 +104,11 @@ def restart_service() -> Tuple[bool, str]:
     Returns:
         Tuple[bool, str]: (success, message)
     """
+    if is_container():
+        _schedule_container_exit()
+        logger.info("Container environment detected; scheduled process exit for container restart")
+        return True, get_container_restart_message()
+
     if is_buildroot():
         if not os.path.exists(INIT_SCRIPT):
             logger.error("Buildroot init script not found: %s", INIT_SCRIPT)

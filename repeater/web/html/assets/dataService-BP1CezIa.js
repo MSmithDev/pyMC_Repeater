@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-DelZA92b.js";export{e as useDataService};

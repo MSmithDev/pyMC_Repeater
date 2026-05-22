@@ -36,7 +36,7 @@ LOOP_DETECT_MINIMAL = "minimal"
 LOOP_DETECT_MODERATE = "moderate"
 LOOP_DETECT_STRICT = "strict"
 
-# Thresholds for 1-byte path hashes loop detection.
+# Thresholds for flood loop detection (hash-size-aware: 1, 2, or 3 bytes per hop).
 # Count how many times our own hash already exists in the incoming FLOOD path.
 # If occurrences >= threshold, treat as loop and drop.
 LOOP_DETECT_MAX_COUNTERS = {
@@ -590,6 +590,20 @@ class RepeaterHandler(BaseHandler):
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         payload = getattr(packet, "payload", None)
         payload_len = len(payload or b"")
+
+        # LoRa time-on-air for this packet (Semtech reference formula).
+        # Computed once here so every downstream consumer (MQTT, SQLite, Glass,
+        # websocket) reads the same value instead of recomputing or shipping
+        # zeros. The same calculator is used by the RX accumulator and the
+        # duty-cycle gate, keeping reporting and metering aligned.
+        airtime_ms = 0.0
+        try:
+            raw_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
+            if raw_len > 0:
+                airtime_ms = float(self.airtime_mgr.calculate_airtime(raw_len))
+        except Exception as e:
+            logger.debug(f"Could not compute airtime for packet record: {e}")
+
         return {
             "timestamp": time.time(),
             "header": (
@@ -608,6 +622,7 @@ class RepeaterHandler(BaseHandler):
                 snr, payload_len, self.radio_config["spreading_factor"]
             ),
             "tx_delay_ms": tx_delay_ms,
+            "airtime_ms": airtime_ms,
             "transmitted": transmitted,
             "is_duplicate": is_duplicate,
             "packet_hash": pkt_hash[:16],
@@ -727,8 +742,14 @@ class RepeaterHandler(BaseHandler):
         if max_counter is None:
             return False
 
+        hash_size = packet.get_path_hash_size()
+        hop_count = packet.get_path_hash_count()
         path = packet.path or bytearray()
-        local_count = sum(1 for hop in path if hop == self.local_hash)
+        local_hash = self.local_hash_bytes[:hash_size]
+        local_count = sum(
+            1 for i in range(hop_count)
+            if bytes(path[i * hash_size:(i + 1) * hash_size]) == local_hash
+        )
         return local_count >= max_counter
 
     def _check_transport_codes(self, packet: Packet) -> Tuple[bool, str]:

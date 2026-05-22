@@ -21,8 +21,11 @@ SILENT_MODE="${PYMC_SILENT:-${SILENT:-}}"
 R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
 PIWHEELS_INDEX_URL="https://www.piwheels.org/simple"
 R2_ENABLED=1
+YQ_VERSION="${YQ_VERSION:-v4.44.3}"
 PYMC_CORE_REPO="${PYMC_CORE_REPO:-https://github.com/rightup/pyMC_core.git}"
 PYMC_CORE_REF="${PYMC_CORE_REF:-}"
+PYMC_CORE_LOCAL_DIR="${PYMC_CORE_LOCAL_DIR:-}"
+PYMC_SKIP_BUILDROOT_DEP_INSTALL="${PYMC_SKIP_BUILDROOT_DEP_INSTALL:-0}"
 RADIO_SETTINGS_JSON="$SCRIPT_DIR/radio-settings.json"
 RADIO_PRESETS_JSON="$SCRIPT_DIR/radio-presets.json"
 BUILDROOT_RADIO_SETTINGS_JSON="$SCRIPT_DIR/radio-settings-buildroot.json"
@@ -59,6 +62,41 @@ warn() {
 fail() {
     printf '%s\n' "$1" >&2
     exit 1
+}
+
+run_with_spinner() {
+    local message="$1"
+    shift
+
+    if [ ! -t 1 ] || [ "${SILENT_MODE:-}" = "1" ] || [ "${SILENT_MODE:-}" = "true" ]; then
+        "$@"
+        return $?
+    fi
+
+    local log_file pid spinner_index status
+    local spinner='|/-\'
+
+    log_file=$(mktemp)
+    "$@" >"$log_file" 2>&1 &
+    pid=$!
+    spinner_index=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r  - %s... %s' "$message" "${spinner:$spinner_index:1}"
+        spinner_index=$(( (spinner_index + 1) % 4 ))
+        sleep 0.15
+    done
+
+    wait "$pid"
+    status=$?
+    printf '\r\033[K'
+
+    if [ "$status" -ne 0 ]; then
+        cat "$log_file" >&2
+    fi
+
+    rm -f "$log_file"
+    return "$status"
 }
 
 detect_local_git_ref() {
@@ -113,6 +151,16 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
 
+normalize_interactive_tty() {
+    [ -t 0 ] || return 0
+    [ -r /dev/tty ] || return 0
+
+    # Buildroot shells sometimes end up with a bad erase character, which
+    # makes backspace print ^H during interactive prompts.
+    stty sane < /dev/tty >/dev/null 2>&1 || true
+    stty erase '^H' < /dev/tty >/dev/null 2>&1 || true
+}
+
 is_buildroot() {
     [ -f /etc/pymc-image-build-id ] && return 0
     [ -f /etc/os-release ] && grep -q '^ID=buildroot$' /etc/os-release 2>/dev/null && return 0
@@ -129,6 +177,8 @@ prompt_value() {
         return 0
     fi
 
+    normalize_interactive_tty
+
     if [ -n "$default_value" ]; then
         printf '%s [%s]: ' "$prompt" "$default_value" >&2
     else
@@ -141,6 +191,8 @@ prompt_value() {
 
 prompt_secret() {
     local prompt="$1"
+
+    normalize_interactive_tty
 
     python3 - "$prompt" <<'PY'
 import os
@@ -315,6 +367,59 @@ install_system_packages() {
         libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev
 }
 
+get_yq_cmd() {
+    local candidate
+
+    for candidate in /usr/local/bin/yq /usr/bin/yq; do
+        if [ -x "$candidate" ] && "$candidate" --version 2>&1 | grep -q "mikefarah/yq"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ensure_yq() {
+    local yq_cmd yq_binary
+
+    yq_cmd=$(get_yq_cmd 2>/dev/null || true)
+    if [ -n "$yq_cmd" ]; then
+        printf '%s\n' "$yq_cmd"
+        return 0
+    fi
+
+    need_cmd wget
+
+    case "$(uname -m)" in
+        aarch64|arm64) yq_binary="yq_linux_arm64" ;;
+        x86_64|amd64) yq_binary="yq_linux_amd64" ;;
+        armv7l|armv7) yq_binary="yq_linux_arm" ;;
+        *)
+            warn "Unable to install yq automatically on unsupported architecture: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    printf '\n==> Installing yq\n' >&2
+    printf '  - Fetching mikefarah/yq %s\n' "$YQ_VERSION" >&2
+    wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${yq_binary}" || {
+        warn "Failed to download yq; config updates will keep working but comments will not be preserved."
+        rm -f /usr/local/bin/yq
+        return 1
+    }
+    chmod +x /usr/local/bin/yq
+
+    yq_cmd=$(get_yq_cmd 2>/dev/null || true)
+    if [ -n "$yq_cmd" ]; then
+        printf '%s\n' "$yq_cmd"
+        return 0
+    fi
+
+    warn "Installed yq is not the expected mikefarah/yq binary."
+    return 1
+}
+
 ensure_venv() {
     local recreate=0
 
@@ -332,9 +437,10 @@ ensure_venv() {
         stage "Creating virtual environment"
         info "Creating $VENV_DIR"
         info "This can take a minute on Buildroot flash storage."
-        python3 -m venv "$VENV_DIR"
-        info "Bootstrapping pip, setuptools, and wheel"
-        "$VENV_PIP" install --upgrade --no-cache-dir pip setuptools wheel
+        run_with_spinner "Creating virtual environment" python3 -m venv "$VENV_DIR"
+        info "Bootstrapping pip, setuptools, wheel, and setuptools_scm"
+        run_with_spinner "Bootstrapping Python build tools" \
+            "$VENV_PIP" install --upgrade --no-cache-dir pip setuptools wheel setuptools_scm
         info "Virtual environment is ready"
     else
         info "Using existing virtual environment at $VENV_DIR"
@@ -345,6 +451,7 @@ ensure_venv_build_backend() {
     if "$VENV_PYTHON" - <<'PY'
 import setuptools
 import setuptools.build_meta
+import setuptools_scm
 import wheel
 PY
     then
@@ -353,14 +460,16 @@ PY
     fi
 
     stage "Rebuilding virtual environment"
-    warn "Existing venv is contaminated or incomplete; recreating it cleanly."
+    warn "Existing venv is missing required Python build packages or has incompatible leftovers; recreating it cleanly. This can take a minute on Buildroot flash storage."
     rm -rf "$VENV_DIR"
-    python3 -m venv "$VENV_DIR"
-    "$VENV_PIP" install --upgrade --no-cache-dir pip setuptools wheel
+    run_with_spinner "Recreating virtual environment" python3 -m venv "$VENV_DIR"
+    run_with_spinner "Reinstalling Python build tools" \
+        "$VENV_PIP" install --upgrade --no-cache-dir pip setuptools wheel setuptools_scm
 
     if "$VENV_PYTHON" - <<'PY'
 import setuptools
 import setuptools.build_meta
+import setuptools_scm
 import wheel
 PY
     then
@@ -426,6 +535,15 @@ install_buildroot_dependencies() {
     local wheel_base
     local deps
 
+    if [ "${PYMC_SKIP_BUILDROOT_DEP_INSTALL}" = "1" ]; then
+        stage "Checking embedded Python dependency baseline"
+        if check_buildroot_dependencies_installed >/dev/null 2>&1; then
+            info "Image-provided Python dependency wheels already satisfy Buildroot requirements"
+            return 0
+        fi
+        fail "Embedded/offline install requested, but the required Python dependency wheels are not already present in the image."
+    fi
+
     wheel_base=$(get_r2_wheel_base 2>/dev/null || true)
     deps=$(set_wheel_dependencies)
     stage "Installing Python dependency wheels"
@@ -446,6 +564,34 @@ install_buildroot_dependencies() {
             --extra-index-url "${PIWHEELS_INDEX_URL}" \
             $deps
     fi
+}
+
+check_buildroot_dependencies_installed() {
+    local deps
+
+    deps=$(set_wheel_dependencies)
+    "$VENV_PYTHON" - $deps <<'PY'
+import sys
+from importlib import metadata
+from packaging.requirements import Requirement
+from packaging.version import Version
+
+failed = []
+for raw in sys.argv[1:]:
+    req = Requirement(raw)
+    try:
+        installed = metadata.version(req.name)
+    except metadata.PackageNotFoundError:
+        failed.append(f"{req.name} (missing)")
+        continue
+    if req.specifier and Version(installed) not in req.specifier:
+        failed.append(f"{req.name} {installed} (! {req.specifier})")
+
+if failed:
+    for item in failed:
+        print(item)
+    raise SystemExit(1)
+PY
 }
 
 link_system_site_packages() {
@@ -476,8 +622,31 @@ PY
     info "Linked image-provided Python runtime into the venv"
 }
 
+remove_shadowing_buildroot_native_packages() {
+    local removed=0
+
+    if "$VENV_PIP" show python-periphery >/dev/null 2>&1; then
+        stage "Restoring Buildroot GPIO runtime"
+        info "Removing venv-installed python-periphery so the image-provided package is used"
+        "$VENV_PIP" uninstall -y python-periphery >/dev/null 2>&1 || true
+        removed=1
+    fi
+
+    if [ "$removed" -eq 0 ]; then
+        info "No shadowing Buildroot native GPIO wheels found in the venv"
+    fi
+}
+
 install_core_into_venv() {
     local core_repo core_ref core_spec
+
+    if [ -n "$PYMC_CORE_LOCAL_DIR" ]; then
+        [ -d "$PYMC_CORE_LOCAL_DIR" ] || fail "Missing local pyMC_core checkout: $PYMC_CORE_LOCAL_DIR"
+        stage "Installing pyMC_core"
+        info "Local dir: ${PYMC_CORE_LOCAL_DIR}"
+        "$VENV_PIP" install --upgrade --no-cache-dir --no-deps --no-build-isolation "$PYMC_CORE_LOCAL_DIR"
+        return 0
+    fi
 
     core_repo="$PYMC_CORE_REPO"
     case "$core_repo" in
@@ -490,6 +659,37 @@ install_core_into_venv() {
     info "Repo: ${PYMC_CORE_REPO}"
     info "Ref: ${core_ref}"
     "$VENV_PIP" install --upgrade --no-cache-dir --no-deps --no-build-isolation "$core_spec"
+}
+
+get_installed_core_commit() {
+    "$VENV_PYTHON" - <<'PY'
+import glob
+import json
+import os
+
+matches = glob.glob("/opt/pymc_repeater/venv/lib/python*/site-packages/pymc_core-*.dist-info/direct_url.json")
+for path in matches:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        print(data.get("vcs_info", {}).get("commit_id", ""))
+        raise SystemExit(0)
+    except Exception:
+        pass
+print("")
+PY
+}
+
+resolve_core_commit() {
+    local core_repo core_ref
+
+    core_repo="$PYMC_CORE_REPO"
+    case "$core_repo" in
+        *.git) ;;
+        *) core_repo="${core_repo}.git" ;;
+    esac
+    core_ref=$(resolve_core_ref)
+    git ls-remote "$core_repo" "$core_ref" 2>/dev/null | awk 'NR==1 {print $1}'
 }
 
 install_repeater_package() {
@@ -839,13 +1039,22 @@ write_repeater_config() {
     local tx_power="$8"
     local board_key="$9"
 
-    python3 - "$CONFIG_DIR/config.yaml" "$RADIO_SETTINGS_JSON" "$BUILDROOT_RADIO_SETTINGS_JSON" "$node_name" "$admin_password" "$jwt_secret" "$freq_mhz" "$sf" "$bw_khz" "$coding_rate" "$tx_power" "$board_key" <<'PY'
+    local config_path temp_config example_config yq_cmd stripped_user temp_merged
+
+    config_path="$CONFIG_DIR/config.yaml"
+    example_config="$CONFIG_DIR/config.yaml.example"
+    temp_config=$(mktemp)
+    stripped_user=$(mktemp)
+    temp_merged=$(mktemp)
+
+    python3 - "$config_path" "$temp_config" "$RADIO_SETTINGS_JSON" "$BUILDROOT_RADIO_SETTINGS_JSON" "$node_name" "$admin_password" "$jwt_secret" "$freq_mhz" "$sf" "$bw_khz" "$coding_rate" "$tx_power" "$board_key" <<'PY'
 import json
 import sys
 import yaml
 
 (
     config_path,
+    output_path,
     radio_settings_path,
     buildroot_settings_path,
     node_name,
@@ -857,7 +1066,7 @@ import yaml
     coding_rate,
     tx_power,
     board_key,
-) = sys.argv[1:13]
+) = sys.argv[1:14]
 
 with open(config_path, "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh) or {}
@@ -904,9 +1113,25 @@ if data["radio_type"] == "sx1262_ch341":
     if "pid" in hardware:
         ch341["pid"] = hardware["pid"]
 
-with open(config_path, "w", encoding="utf-8") as fh:
+with open(output_path, "w", encoding="utf-8") as fh:
     yaml.safe_dump(data, fh, sort_keys=False)
 PY
+
+    yq_cmd=$(ensure_yq 2>/dev/null || true)
+    if [ -n "$yq_cmd" ] && [ -f "$example_config" ]; then
+        "$yq_cmd" eval '... comments=""' "$temp_config" > "$stripped_user" 2>/dev/null || cp "$temp_config" "$stripped_user"
+        if "$yq_cmd" eval-all '. as $item ireduce ({}; . * $item)' "$example_config" "$stripped_user" > "$temp_merged" 2>/dev/null \
+            && "$yq_cmd" eval '.' "$temp_merged" >/dev/null 2>&1; then
+            mv "$temp_merged" "$config_path"
+        else
+            warn "yq merge failed; writing config without preserving comments."
+            cp "$temp_config" "$config_path"
+        fi
+    else
+        cp "$temp_config" "$config_path"
+    fi
+
+    rm -f "$temp_config" "$stripped_user" "$temp_merged"
 }
 
 seed_repeater_config() {
@@ -997,12 +1222,41 @@ is_running() {
     [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
 }
 
+start_or_restart_service() {
+    if is_running; then
+        "$INIT_SCRIPT" restart
+    else
+        "$INIT_SCRIPT" start
+    fi
+}
+
 get_version() {
     if [ -x "$VENV_PYTHON" ]; then
         "$VENV_PYTHON" -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null || echo "not installed"
     else
         echo "not installed"
     fi
+}
+
+prepare_git_version() {
+    local git_version
+
+    if [ -d "$SCRIPT_DIR/.git" ]; then
+        stage "Inspecting checked-out repo version"
+        info "Fetching tags for setuptools_scm version detection"
+        git -C "$SCRIPT_DIR" fetch --tags 2>/dev/null || true
+        git_version=$(python3 -m setuptools_scm 2>/dev/null || echo "1.0.5")
+        export SETUPTOOLS_SCM_PRETEND_VERSION="$git_version"
+        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER="$git_version"
+        info "Using version: $git_version"
+    else
+        git_version="1.0.5"
+        export SETUPTOOLS_SCM_PRETEND_VERSION="$git_version"
+        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYMC_REPEATER="$git_version"
+        info "Using fallback version: $git_version"
+    fi
+
+    printf '%s\n' "$git_version"
 }
 
 doctor() {
@@ -1094,6 +1348,7 @@ install_repeater() {
     ensure_root
     stage "Preparing Buildroot installation"
     install_system_packages
+    ensure_yq >/dev/null 2>&1 || true
     ensure_service_user
 
     stage "Preparing directories and config"
@@ -1115,22 +1370,13 @@ install_repeater() {
     stage "Cleaning legacy install state"
     cleanup_legacy_install_state
 
-    if [ -d "$SCRIPT_DIR/.git" ]; then
-        stage "Inspecting checked-out repo version"
-        info "Fetching tags for setuptools_scm version detection"
-        git -C "$SCRIPT_DIR" fetch --tags 2>/dev/null || true
-        git_version=$(python3 -m setuptools_scm 2>/dev/null || echo "1.0.5")
-        export SETUPTOOLS_SCM_PRETEND_VERSION="$git_version"
-        info "Using version: $git_version"
-    else
-        export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
-        info "Using fallback version: 1.0.5"
-    fi
+    git_version=$(prepare_git_version)
 
     preinstall_r2_wheels
     install_buildroot_dependencies
     install_core_into_venv
     install_repeater_package
+    remove_shadowing_buildroot_native_packages
     link_system_site_packages
 
     stage "Validating installed runtime"
@@ -1146,7 +1392,7 @@ install_repeater() {
     create_init_script
 
     stage "Starting service"
-    "$INIT_SCRIPT" restart
+    start_or_restart_service
 
     ip_address=$(get_primary_ip)
     if is_running; then
@@ -1157,19 +1403,46 @@ install_repeater() {
 }
 
 upgrade_repeater() {
+    local current_version new_version ip_address git_version
+    local target_core_commit installed_core_commit
+
     ensure_root
     is_installed || fail "Service is not installed."
+    current_version=$(get_version)
 
     ensure_venv
     ensure_venv_build_backend
     stage "Cleaning legacy install state"
     cleanup_legacy_install_state
+    git_version=$(prepare_git_version)
     preinstall_r2_wheels
 
     stage "Upgrading pyMC Repeater"
-    install_buildroot_dependencies
-    install_core_into_venv
-    install_repeater_package
+    if [ "${PYMC_FORCE_DEPS:-0}" = "1" ]; then
+        info "Forcing dependency reinstall"
+        install_buildroot_dependencies
+    elif check_buildroot_dependencies_installed >/dev/null 2>&1; then
+        info "Python dependency wheels already satisfy Buildroot requirements; skipping reinstall"
+    else
+        info "One or more Python dependency wheels are missing or out of range; reinstalling"
+        install_buildroot_dependencies
+    fi
+
+    target_core_commit=$(resolve_core_commit)
+    installed_core_commit=$(get_installed_core_commit)
+    if [ -n "$target_core_commit" ] && [ "$installed_core_commit" = "$target_core_commit" ] && [ "${PYMC_FORCE_CORE:-0}" != "1" ]; then
+        info "pyMC_core is already at ${target_core_commit}; skipping reinstall"
+    else
+        install_core_into_venv
+    fi
+
+    if [ "$current_version" = "$git_version" ] && [ "${PYMC_FORCE_REPEATER:-0}" != "1" ]; then
+        info "pyMC Repeater is already at ${git_version}; skipping reinstall"
+    else
+        ensure_yq >/dev/null 2>&1 || true
+        install_repeater_package
+    fi
+    remove_shadowing_buildroot_native_packages
     link_system_site_packages
     stage "Validating installed runtime"
     if check_venv_runtime; then
@@ -1177,7 +1450,20 @@ upgrade_repeater() {
     else
         fail "Installed packages are present but one or more native modules are unusable on this image."
     fi
+
+    stage "Restarting service"
     "$INIT_SCRIPT" restart
+
+    new_version=$(get_version)
+    ip_address=$(get_primary_ip)
+
+    if is_running; then
+        printf '\nUpgrade complete.\n'
+        printf 'Version: %s -> %s\n' "$current_version" "$new_version"
+        printf 'Service is running on: http://%s:8000\n' "${ip_address}"
+    else
+        fail "Upgrade completed but the service failed to start. Check: sh $0 logs"
+    fi
 }
 
 uninstall_repeater() {

@@ -186,6 +186,7 @@
     "ch341-usb-sx1262": {
       "name": "CH341 USB-SPI + SX1262 (example)",
       "description": "SX1262 via CH341 USB-to-SPI adapter. NOTE: pin numbers are CH341 GPIO 0-7, not BCM.",
+      "connection_type": "usb",
       "radio_type": "sx1262_ch341",
       "vid": 6790,
       "pid": 21778,
@@ -286,6 +287,66 @@
       "preamble_length": 17,
       "use_gpiod_backend": true,
       "gpio_chip": 1
+    },
+      "ultrapeaterzero-e22": {
+      "name": "Zindello Industries UltraPeaterZero E22",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 24,
+      "reset_pin": 25,
+      "busy_pin": 5,
+      "irq_pin": 12,
+      "txen_pin": 27,
+      "rxen_pin": 17,
+      "en_pins": [16],
+      "txled_pin": 21,
+      "rxled_pin": 20,
+      "tx_power": 22,
+      "use_dio2_rf": false,
+      "use_dio3_tcxo": true,
+      "preamble_length": 17
+    },
+      "ultrapeaterzero-e22p": {
+      "name": "Zindello Industries UltraPeaterZero E22P",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 24,
+      "reset_pin": 25,
+      "busy_pin": 5,
+      "irq_pin": 12,
+      "txen_pin": 27,
+      "rxen_pin": -1,
+      "en_pins": [17, 16],
+      "txled_pin": 21,
+      "rxled_pin": 20,
+      "tx_power": 22,
+      "use_dio2_rf": false,
+      "use_dio3_tcxo": true,
+      "preamble_length": 17
+    },
+    "pymc_usb": {
+      "name": "pymc_usb modem (USB-CDC)",
+      "description": "ESP32-S3 / nRF52 board running pymc_usb firmware as a USB-CDC LoRa modem. Pick this if the modem is plugged into the host's USB port (e.g. /dev/ttyACM0). Edit the 'pymc_usb' section after first-run to point at the right serial device.",
+      "connection_type": "usb",
+      "radio_type": "pymc_usb",
+      "tx_power": 22,
+      "preamble_length": 16
+    },
+    "pymc_tcp": {
+      "name": "pymc_tcp modem (Wi-Fi / Ethernet)",
+      "description": "ESP32 board running pymc_usb firmware exposed as a TCP server over Wi-Fi or Ethernet. After first-run, set 'pymc_tcp.host' to the modem's LAN address or mDNS name (e.g. pymc-3e2834.local).",
+      "connection_type": "network",
+      "radio_type": "pymc_tcp",
+      "tx_power": 22,
+      "preamble_length": 16
+    },
+    "kiss": {
+      "name": "KISS modem (serial)",
+      "description": "MeshCore KISS modem over serial - requires pyMC_core with KISS support.",
+      "connection_type": "usb",
+      "radio_type": "kiss",
+      "tx_power": 14,
+      "preamble_length": 17
     }
   }
 }
