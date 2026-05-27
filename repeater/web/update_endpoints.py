@@ -32,6 +32,7 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 import cherrypy
+
 from repeater.service_utils import get_container_restart_message, is_buildroot, is_container
 
 logger = logging.getLogger("HTTPServer")
@@ -192,8 +193,9 @@ def _get_installed_version(force_refresh: bool = False) -> str:
     # If the running process is already on a higher version than anything found
     # on disk, the dist-info dirs are stale leftovers and __version__ is truth.
     try:
-        from repeater import __version__ as _running
         from packaging.version import Version
+
+        from repeater import __version__ as _running
 
         if Version(_running) > Version(disk_version):
             # status() polls can call this frequently; throttle mismatch logs.

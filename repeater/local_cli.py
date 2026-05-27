@@ -8,7 +8,6 @@ import sys
 from typing import Optional
 from urllib.parse import urlparse
 
-
 CONFIG_PATHS = [
     "/etc/pymc_repeater/config.yaml",
     "config.yaml",
@@ -25,8 +24,9 @@ def _validate_http_url(url: str) -> None:
 
 def _load_config(config_path=None):
     """Load repeater config.yaml, trying common paths."""
-    import yaml
     from pathlib import Path
+
+    import yaml
 
     paths = [config_path] if config_path else CONFIG_PATHS
     for p in paths:
@@ -41,9 +41,9 @@ def run_client_cli(host: str = "127.0.0.1", port: int = 8000, password: Optional
     """
     Standalone CLI client that connects to a running repeater's HTTP API.
     """
-    import urllib.request
-    import urllib.error
     import json
+    import urllib.error
+    import urllib.request
 
     base_url = f"http://{host}:{port}"
 
