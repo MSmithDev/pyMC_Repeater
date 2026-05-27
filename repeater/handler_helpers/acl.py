@@ -35,25 +35,24 @@ class ClientInfo:
 
 
 class ACL:
-
     def __init__(
         self,
         max_clients: int = 50,
-        admin_password: str = "admin123",
-        guest_password: str = "guest123",
+        admin_password: Optional[str] = None,
+        guest_password: Optional[str] = None,
         allow_read_only: bool = True,
     ):
         self.max_clients = max_clients
-        self.admin_password = admin_password
-        self.guest_password = guest_password
+        self.admin_password = admin_password or ""
+        self.guest_password = guest_password or ""
         self.allow_read_only = allow_read_only
         self.clients: Dict[bytes, ClientInfo] = {}
 
     def authenticate_client(
-        self, 
-        client_identity: Identity, 
-        shared_secret: bytes, 
-        password: str, 
+        self,
+        client_identity: Identity,
+        shared_secret: bytes,
+        password: str,
         timestamp: int,
         sync_since: int = None,
         target_identity_hash: int = None,
@@ -62,18 +61,18 @@ class ACL:
     ) -> tuple[bool, int]:
 
         target_identity_config = target_identity_config or {}
-        
+
         # Check for identity-specific passwords (required for room servers)
         identity_settings = target_identity_config.get("settings", {})
-        
+
         # Determine if this is a room server by checking the type field
         identity_type = target_identity_config.get("type", "")
         is_room_server = identity_type == "room_server"
-        
+
         # Log sync_since if provided (room server format)
         if sync_since is not None:
             logger.debug(f"Client sync_since timestamp: {sync_since}")
-        
+
         if is_room_server:
             # Room servers use passwords from their settings section only
             # Empty strings are treated as "not set"
@@ -93,6 +92,9 @@ class ACL:
                 f"Repeater passwords - admin: {'SET' if admin_pwd else 'NONE'}, "
                 f"guest: {'SET' if guest_pwd else 'NONE'}"
             )
+
+        admin_pwd = admin_pwd or ""
+        guest_pwd = guest_pwd or ""
 
         if target_identity_name:
             logger.debug(
@@ -153,7 +155,7 @@ class ACL:
         client.permissions &= ~PERM_ACL_ROLE_MASK
         client.permissions |= permissions
         client.shared_secret = shared_secret
-        
+
         # Store sync_since for room server clients
         if sync_since is not None:
             client.sync_since = sync_since

@@ -20,7 +20,9 @@ def test_jwt_handler_create_and_verify_and_invalid_cases():
     assert payload["sub"] == "admin"
     assert payload["client_id"] == "client-1"
 
-    expired = jwt.encode({"sub": "admin", "client_id": "c", "iat": 1, "exp": 1}, secret, algorithm="HS256")
+    expired = jwt.encode(
+        {"sub": "admin", "client_id": "c", "iat": 1, "exp": 1}, secret, algorithm="HS256"
+    )
     assert h.verify_jwt(expired) is None
     assert h.verify_jwt("not-a-token") is None
 
@@ -71,11 +73,12 @@ def test_check_auth_skips_options_and_login(monkeypatch):
     assert check_auth() is None
 
 
-def test_check_auth_missing_handlers_returns_500_json(monkeypatch):
+def test_check_auth_missing_handlers_raises_http_500(monkeypatch):
     _set_cp(monkeypatch, cfg={})
-    out = check_auth()
-    assert out["success"] is False
-    assert cherrypy.response.status == 500
+    with pytest.raises(cherrypy.HTTPError) as exc_info:
+        check_auth()
+
+    assert exc_info.value.status == 500
 
 
 def test_check_auth_accepts_bearer_token(monkeypatch):
