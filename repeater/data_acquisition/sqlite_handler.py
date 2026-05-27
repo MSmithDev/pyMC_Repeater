@@ -1641,13 +1641,13 @@ class SQLiteHandler:
             logger.error(f"Failed to get adverts count for contact_type '{contact_type}': {e}")
             return 0
 
-    def generate_transport_key(self, name: str, key_length_bytes: int = 32) -> str:
+    def generate_transport_key(self, name: str, key_length_bytes: int = 16) -> str:
         """
-        Generate a transport key using the proper MeshCore key derivation.
+        Generate a transport key using MeshCore-compatible key derivation.
 
         Args:
             name: The key name to derive the key from
-            key_length_bytes: Length of the key in bytes (default: 32 bytes = 256 bits)
+            key_length_bytes: Fallback random key length in bytes (default: 16)
 
         Returns:
             A base64-encoded transport key derived from the name
@@ -1655,7 +1655,6 @@ class SQLiteHandler:
         try:
             from pymc_core.protocol.transport_keys import get_auto_key_for
 
-            # Use the proper MeshCore key derivation function
             key_bytes = get_auto_key_for(name)
 
             # Encode to base64 for safe storage and transmission
@@ -1668,9 +1667,9 @@ class SQLiteHandler:
 
         except Exception as e:
             logger.error(f"Failed to generate transport key using get_auto_key_for: {e}")
-            # Fallback to secure random if MeshCore function fails
+            # Fallback to a transport-compatible random 16-byte key if derivation fails.
             try:
-                random_bytes = secrets.token_bytes(key_length_bytes)
+                random_bytes = secrets.token_bytes(16)
                 key = base64.b64encode(random_bytes).decode("utf-8")
                 logger.warning(f"Using fallback random key generation for '{name}'")
                 return key

@@ -1,4 +1,7 @@
+import base64
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
@@ -59,6 +62,36 @@ def test_transport_key_crud_cycle(tmp_path):
     assert h.delete_transport_key(key_id) is True
     assert h.get_transport_key_by_id(key_id) is None
     assert h.delete_transport_key(key_id) is False
+
+
+def test_generate_transport_key_uses_implicit_hashtag_region(tmp_path, monkeypatch):
+    h = _make_handler(tmp_path)
+
+    captured = {}
+    fake_transport_keys = types.ModuleType("pymc_core.protocol.transport_keys")
+
+    def _fake_get_auto_key_for(name: str) -> bytes:
+        captured["name"] = name
+        return b"0123456789abcdef"
+
+    fake_transport_keys.get_auto_key_for = _fake_get_auto_key_for
+
+    fake_protocol = types.ModuleType("pymc_core.protocol")
+    fake_protocol.transport_keys = fake_transport_keys
+
+    fake_core = types.ModuleType("pymc_core")
+    fake_core.protocol = fake_protocol
+
+    monkeypatch.setitem(sys.modules, "pymc_core", fake_core)
+    monkeypatch.setitem(sys.modules, "pymc_core.protocol", fake_protocol)
+    monkeypatch.setitem(sys.modules, "pymc_core.protocol.transport_keys", fake_transport_keys)
+
+    generated = h.generate_transport_key("eu")
+    generated_bytes = base64.b64decode(generated)
+
+    assert captured["name"] == "eu"
+    assert generated_bytes == b"0123456789abcdef"
+    assert len(generated_bytes) == 16
 
 
 def test_room_messages_and_sync_flow(tmp_path):
