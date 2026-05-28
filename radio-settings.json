@@ -183,6 +183,23 @@
       "use_dio2_rf": true,
       "preamble_length": 17
     },
+    "nebra-duo-hat": {
+      "name": "NebraDuo-E22P-1W",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 22,
+      "busy_pin": 23,
+      "irq_pin": 24,
+      "txen_pin": -1,
+      "rxen_pin": 1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 22,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
+      "preamble_length": 17
+    },
     "ch341-usb-sx1262": {
       "name": "CH341 USB-SPI + SX1262 (example)",
       "description": "SX1262 via CH341 USB-to-SPI adapter. NOTE: pin numbers are CH341 GPIO 0-7, not BCM.",
