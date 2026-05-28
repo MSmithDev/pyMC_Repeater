@@ -44,6 +44,14 @@ repos:
   # Test suite gate
   - repo: local
     hooks:
+      - id: openapi-contract-check
+        name: OpenAPI contract check
+        entry: python3 scripts/check_openapi_contract.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        files: ^(repeater/web/.*\.py|repeater/web/openapi\.yaml)$
+
       - id: pytest
         name: pytest
         entry: ./scripts/precommit-pytest.sh
